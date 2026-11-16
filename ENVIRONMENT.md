@@ -1,0 +1,1 @@
+Python 3.12.13 on Ubuntu with libcairo2. Install requirements-userfeedback.txt. Run python -m pytest cairosvg/test_api.py -q. The visual non-regression suite requires initializing its reference submodule and is not included in this API baseline. Full commit history is local; older blobs remain fetchable from the promisor upstream. No rendering changes in this initial snapshot.
