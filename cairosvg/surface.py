@@ -10,8 +10,9 @@ import cairocffi as cairo
 
 from .colors import color, negate_color
 from .defs import (
-    apply_filter_after_painting, apply_filter_before_painting, clip_path,
-    filter_, gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
+    apply_filter_after_painting, apply_filter_before_painting,
+    apply_gaussian_blur, clip_path, filter_, filter_has_gaussian_blur,
+    gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
     parse_all_defs, pattern, prepare_filter, radial_gradient, use)
 from .helpers import (
     UNITS, PointError, clip_rect, node_format, normalize, paint,
@@ -478,15 +479,21 @@ class Surface(object):
 
         # Apply filter, mask and opacity
         if filter_ or mask or (opacity < 1 and node.children):
-            self.context.pop_group_to_source()
-            if filter_:
-                apply_filter_before_painting(self, node, filter_)
-            if mask in self.masks:
-                paint_mask(self, node, mask, opacity)
+            if filter_ and filter_has_gaussian_blur(self, node, filter_):
+                # Opacity of leaf nodes is already included in fill and
+                # stroke opacities, don't apply it twice
+                apply_gaussian_blur(
+                    self, node, filter_, opacity if node.children else 1)
             else:
-                self.context.paint_with_alpha(opacity)
-            if filter_:
-                apply_filter_after_painting(self, node, filter_)
+                self.context.pop_group_to_source()
+                if filter_:
+                    apply_filter_before_painting(self, node, filter_)
+                if mask in self.masks:
+                    paint_mask(self, node, mask, opacity)
+                else:
+                    self.context.paint_with_alpha(opacity)
+                if filter_:
+                    apply_filter_after_painting(self, node, filter_)
 
         # Clean cursor's position after 'text' tags
         if node.tag == 'text':

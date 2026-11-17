@@ -5,13 +5,22 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+from math import ceil, floor, isfinite
+from re import IGNORECASE, compile as re_compile
+
+from PIL import Image, ImageFilter
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
-from .helpers import paint, size, transform
+from .helpers import normalize, paint, size, transform
 from .parser import Tree
 from .shapes import rect
 from .surface import cairo
 from .url import parse_url
+
+NUMBER = re_compile(
+    r'^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)(e[+-]?[0-9]+)?'
+    r'(px|pt|pc|mm|cm|in|em|ex|ch|%)?$', IGNORECASE)
 
 BLEND_OPERATORS = {
     'darken': cairo.OPERATOR_DARKEN,
@@ -285,6 +294,135 @@ def prepare_filter(surface, node, name):
                     dx = size(surface, child.get('dx', 0), 1)
                     dy = size(surface, child.get('dy', 0), 1)
                 surface.context.translate(dx, dy)
+
+
+def filter_has_gaussian_blur(surface, node, name):
+    """Know whether the filter applied to ``node`` includes a Gaussian blur."""
+    if 'id' in node and node['id'] in surface.masks:
+        return False
+    if name not in surface.filters:
+        return False
+    return any(
+        child.tag == 'feGaussianBlur'
+        for child in surface.filters[name].children)
+
+
+def parse_std_deviation(surface, value, reference_x, reference_y):
+    """Parse and validate the ``stdDeviation`` value of a Gaussian blur.
+
+    Return the horizontal and vertical standard deviations.
+
+    """
+    values = normalize(value).split(' ') if value else ['0']
+    if len(values) > 2:
+        raise ValueError(
+            f'stdDeviation takes 1 or 2 values, got {len(values)}: {value!r}')
+    if not all(NUMBER.match(item) for item in values):
+        raise ValueError(f'Invalid stdDeviation value: {value!r}')
+    std_x = size(surface, values[0], reference_x)
+    std_y = size(surface, values[-1], reference_y)
+    for std in (std_x, std_y):
+        if not isfinite(std) or std < 0:
+            raise ValueError(f'Invalid stdDeviation value: {value!r}')
+    return std_x, std_y
+
+
+def apply_gaussian_blur(surface, node, name, opacity):
+    """Paint the current group blurred by the filter's ``feGaussianBlur``.
+
+    The group containing the node drawn on ``surface`` is popped, blurred,
+    and painted back clipped to the filter region.
+
+    """
+    filter_node = surface.filters[name]
+    blur_node = next(
+        child for child in filter_node.children
+        if child.tag == 'feGaussianBlur')
+
+    # Filter region, in current user coordinates
+    bounding_box = calculate_bounding_box(surface, node)
+    empty_region = False
+    if filter_node.get('filterUnits') == 'userSpaceOnUse':
+        x = size(surface, filter_node.get('x', '-10%'), 'x')
+        y = size(surface, filter_node.get('y', '-10%'), 'y')
+        width = size(surface, filter_node.get('width', '120%'), 'x')
+        height = size(surface, filter_node.get('height', '120%'), 'y')
+    elif is_non_empty_bounding_box(bounding_box):
+        box_x, box_y, box_width, box_height = bounding_box
+        x = box_x + size(surface, filter_node.get('x', '-10%'), 1) * box_width
+        y = box_y + size(surface, filter_node.get('y', '-10%'), 1) * box_height
+        width = size(surface, filter_node.get('width', '120%'), 1) * box_width
+        height = (
+            size(surface, filter_node.get('height', '120%'), 1) * box_height)
+    else:
+        # No bounding box: the filter region is empty
+        empty_region = True
+
+    # Standard deviations, in current user coordinates
+    if filter_node.get('primitiveUnits') == 'objectBoundingBox':
+        if is_non_empty_bounding_box(bounding_box):
+            std_x, std_y = parse_std_deviation(
+                surface, blur_node.get('stdDeviation'), 1, 1)
+            std_x *= bounding_box[2]
+            std_y *= bounding_box[3]
+        else:
+            empty_region = True
+            std_x = std_y = 0
+    else:
+        std_x, std_y = parse_std_deviation(
+            surface, blur_node.get('stdDeviation'), 'x', 'y')
+
+    pattern = surface.context.pop_group()
+    if empty_region:
+        return
+
+    # Filter region and standard deviations, in device coordinates
+    matrix = surface.context.get_matrix()
+    device_points = (
+        matrix.transform_point(x, y),
+        matrix.transform_point(x + width, y),
+        matrix.transform_point(x, y + height),
+        matrix.transform_point(x + width, y + height))
+    device_x = floor(min(point[0] for point in device_points))
+    device_y = floor(min(point[1] for point in device_points))
+    device_width = ceil(max(point[0] for point in device_points)) - device_x
+    device_height = ceil(max(point[1] for point in device_points)) - device_y
+    if device_width <= 0 or device_height <= 0:
+        return
+    device_std_x, device_std_y = matrix.transform_distance(std_x, std_y)
+
+    # Paint the group on a surface covering the filter region
+    region_surface = cairo.ImageSurface(
+        cairo.FORMAT_ARGB32, device_width, device_height)
+    region_context = cairo.Context(region_surface)
+    region_context.translate(-device_x, -device_y)
+    # The group's pattern matrix is the current transformation matrix, reset
+    # it to paint the group at its original device position
+    pattern.set_matrix(cairo.Matrix())
+    region_context.set_source(pattern)
+    region_context.paint()
+
+    # Blur the premultiplied channels, so that colors and transparency stay
+    # correct on the blurred edges
+    image = Image.frombuffer(
+        'RGBA', (device_width, device_height), region_surface.get_data(),
+        'raw', 'BGRA', 0, 1)
+    image = image.filter(
+        ImageFilter.GaussianBlur((device_std_x, device_std_y)))
+    blurred_surface = cairo.ImageSurface(
+        cairo.FORMAT_ARGB32, device_width, device_height)
+    blurred_surface.get_data()[:] = image.tobytes('raw', 'BGRA')
+    blurred_surface.mark_dirty()
+
+    # Paint the blurred surface back, clipped to the filter region
+    surface.context.save()
+    surface.context.identity_matrix()
+    surface.context.rectangle(
+        device_x, device_y, device_width, device_height)
+    surface.context.clip()
+    surface.context.set_source_surface(blurred_surface, device_x, device_y)
+    surface.context.paint_with_alpha(opacity)
+    surface.context.restore()
 
 
 def apply_filter_before_painting(surface, node, name):

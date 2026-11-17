@@ -3,6 +3,13 @@
 ======
 
 
+Version 2.9.2, not released yet
+===============================
+
+* Support ``feGaussianBlur`` filters applied to ``SourceGraphic`` in PNG
+  output, with ``filterUnits`` and ``primitiveUnits`` handling
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 
