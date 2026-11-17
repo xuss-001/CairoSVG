@@ -2,6 +2,14 @@
  News
 ======
 
+Unreleased
+==========
+
+* Support explicit ``mask-type`` values for PNG output. Luminance masks use
+  color luminance and alpha, while alpha masks use alpha only.
+* Fix mask opacity being applied twice and mask reuse depending on drawing
+  order.
+
 
 Version 2.9.1 released on 2026-09-07
 ====================================

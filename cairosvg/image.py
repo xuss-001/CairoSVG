@@ -108,6 +108,9 @@ def image(surface, node):
 
     # Paint raster image
     opacity = float(node.get('opacity', 1))
+    if node.get('mask'):
+        # Mask painting applies the opacity after masking the source image.
+        opacity = 1
     surface.context.save()
     surface.context.translate(x, y)
     surface.context.scale(scale_x, scale_y)

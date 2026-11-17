@@ -5,6 +5,10 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+import copy
+import math
+import sys
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
 from .helpers import paint, size, transform
@@ -116,9 +120,158 @@ def clip_path(surface, node):
         surface.paths[node['id']] = node
 
 
-def paint_mask(surface, node, name, opacity):
-    """Paint the mask of the current surface."""
-    mask_node = surface.masks[name]
+def _clone_node(node, parent=None):
+    """Copy a node and its children without sharing mutable attributes."""
+    clone = copy.copy(node)
+    if parent is not None:
+        clone.parent = parent
+    clone.children = [_clone_node(child, clone) for child in node.children]
+    return clone
+
+
+def _object_bounding_box(surface, node):
+    """Get a usable object bounding box for mask geometry."""
+    bounding_box = calculate_bounding_box(surface, node)
+    if is_non_empty_bounding_box(bounding_box):
+        return bounding_box
+
+    x = size(surface, node.get('x'), 'x')
+    y = size(surface, node.get('y'), 'y')
+    width = size(surface, node.get('width'), 'x')
+    height = size(surface, node.get('height'), 'y')
+    if width and height:
+        return x, y, width, height
+
+    width = surface.context_width or surface.width
+    height = surface.context_height or surface.height
+    return 0, 0, width, height
+
+
+def _mask_region(surface, node, mask_node):
+    """Return mask region and object bounding box in user coordinates."""
+    bounding_box = _object_bounding_box(surface, node)
+    if mask_node.get('maskUnits') == 'userSpaceOnUse':
+        x = size(surface, mask_node.get('x', '-10%'), 'x')
+        y = size(surface, mask_node.get('y', '-10%'), 'y')
+        width = size(surface, mask_node.get('width', '120%'), 'x')
+        height = size(surface, mask_node.get('height', '120%'), 'y')
+    else:
+        box_x, box_y, box_width, box_height = bounding_box
+        x = box_x + size(surface, mask_node.get('x', '-10%'), 1) * box_width
+        y = box_y + size(surface, mask_node.get('y', '-10%'), 1) * box_height
+        width = size(
+            surface, mask_node.get('width', '120%'), 1) * box_width
+        height = size(
+            surface, mask_node.get('height', '120%'), 1) * box_height
+    return x, y, width, height, bounding_box
+
+
+def _add_mask_content_transform(mask_node, bounding_box):
+    """Apply objectBoundingBox content units to a cloned mask node."""
+    if mask_node.get('maskContentUnits') != 'objectBoundingBox':
+        return
+
+    x, y, width, height = bounding_box
+    content_transform = 'matrix({}, 0, 0, {}, {}, {})'.format(
+        width, height, x, y)
+    transform_ = mask_node.get('transform')
+    if transform_:
+        mask_node['transform'] = f'{content_transform} {transform_}'
+    else:
+        mask_node['transform'] = content_transform
+
+
+def _mask_surface_scale(surface):
+    """Return the current user-to-device scale for both axes."""
+    matrix = surface.context.get_matrix()
+    scale_x = math.hypot(matrix.xx, matrix.yx)
+    scale_y = math.hypot(matrix.xy, matrix.yy)
+    if not math.isfinite(scale_x) or scale_x <= 0:
+        scale_x = 1
+    if not math.isfinite(scale_y) or scale_y <= 0:
+        scale_y = 1
+    return scale_x, scale_y
+
+
+def _update_mask_alpha(mask_surface, opacity, mask_type):
+    """Apply luminance and opacity to the mask surface alpha channel."""
+    if opacity <= 0:
+        return
+
+    luminance = mask_type == 'luminance'
+    if not luminance and opacity >= 1:
+        return
+
+    mask_surface.cairo.flush()
+    data = mask_surface.cairo.get_data()
+    width = mask_surface.cairo.get_width()
+    height = mask_surface.cairo.get_height()
+    stride = mask_surface.cairo.get_stride()
+    if sys.byteorder == 'little':
+        blue, green, red, alpha = 0, 1, 2, 3
+    else:
+        alpha, red, green, blue = 0, 1, 2, 3
+
+    for row in range(height):
+        row_offset = row * stride
+        for column in range(width):
+            offset = row_offset + column * 4
+            alpha_value = data[offset + alpha][0]
+            if not alpha_value:
+                continue
+            if luminance:
+                red_value = data[offset + red][0] * 255 / alpha_value
+                green_value = data[offset + green][0] * 255 / alpha_value
+                blue_value = data[offset + blue][0] * 255 / alpha_value
+                luminance_value = (
+                    0.2125 * red_value +
+                    0.7154 * green_value +
+                    0.0721 * blue_value) / 255
+            else:
+                luminance_value = 1
+            new_alpha = int(round(
+                alpha_value * luminance_value * opacity))
+            new_alpha = max(0, min(255, new_alpha))
+            data[offset + alpha:offset + alpha + 1] = bytes((new_alpha,))
+    mask_surface.cairo.mark_dirty()
+
+
+def _paint_typed_mask(surface, node, mask_node, opacity):
+    """Paint an explicit alpha or luminance mask on a PNG surface."""
+    mask_type = mask_node.get('mask-type', 'alpha').strip().lower()
+    x, y, width, height, bounding_box = _mask_region(
+        surface, node, mask_node)
+    if width <= 0 or height <= 0 or opacity <= 0:
+        return
+
+    mask_node = _clone_node(mask_node)
+    mask_node.tag = 'g'
+    _add_mask_content_transform(mask_node, bounding_box)
+    mask_node['width'] = width
+    mask_node['height'] = height
+    mask_node['viewBox'] = f'{x} {y} {width} {height}'
+
+    scale_x, scale_y = _mask_surface_scale(surface)
+    image_width = max(1, int(round(width * scale_x)))
+    image_height = max(1, int(round(height * scale_y)))
+
+    from .surface import PNGSurface  # circular import
+    mask_surface = PNGSurface(
+        mask_node, None, surface.dpi, surface,
+        output_width=image_width, output_height=image_height)
+    _update_mask_alpha(mask_surface, opacity, mask_type)
+
+    pattern = cairo.SurfacePattern(mask_surface.cairo)
+    pattern.set_extend(cairo.EXTEND_NONE)
+    pattern.set_matrix(cairo.Matrix(
+        image_width / width, 0, 0, image_height / height,
+        -x * image_width / width, -y * image_height / height))
+    surface.context.mask(pattern)
+
+
+def _paint_legacy_mask(surface, node, mask_node, opacity):
+    """Paint a mask using the historical alpha-based implementation."""
+    mask_node = _clone_node(mask_node)
     mask_node.tag = 'g'
     mask_node['opacity'] = opacity
 
@@ -153,6 +306,20 @@ def paint_mask(surface, node, name, opacity):
         mask_node['height'] / mask_surface.height)
     surface.context.mask_surface(mask_surface.cairo)
     surface.context.restore()
+
+
+def paint_mask(surface, node, name, opacity):
+    """Paint the mask of the current surface."""
+    mask_node = surface.masks[name]
+    mask_type = mask_node.get('mask-type', 'alpha').strip().lower()
+
+    from .surface import PNGSurface  # circular import
+    if ('mask-type' in mask_node and
+            mask_type in ('alpha', 'luminance') and
+            isinstance(surface, PNGSurface)):
+        _paint_typed_mask(surface, node, mask_node, opacity)
+    else:
+        _paint_legacy_mask(surface, node, mask_node, opacity)
 
 
 def draw_gradient(surface, node, name, opacity):
