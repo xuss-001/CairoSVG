@@ -74,6 +74,8 @@ TAGS = {
 PATH_TAGS = frozenset((
     'circle', 'ellipse', 'line', 'path', 'polygon', 'polyline', 'rect'))
 
+NON_SCALING_STROKE_TAGS = frozenset(('path', 'line', 'polygon', 'polyline'))
+
 INVISIBLE_TAGS = frozenset((
     'clipPath', 'filter', 'linearGradient', 'marker', 'mask', 'pattern',
     'radialGradient', 'symbol'))
@@ -219,6 +221,13 @@ class Surface(object):
             self.device_units_per_user_units, self.device_units_per_user_units)
         # Initial, non-rounded dimensions
         self.set_context_size(width, height, viewbox, tree)
+        # Keep a uniform scale for non-scaling strokes. Transformations
+        # applied inside the SVG must not affect their width, even when the
+        # root viewport itself is non-uniform.
+        root_matrix = self.context.get_matrix()
+        self.root_stroke_scale = abs(
+            root_matrix.xx * root_matrix.yy -
+            root_matrix.xy * root_matrix.yx) ** .5
         self.context.move_to(0, 0)
 
         if background_color:
@@ -348,12 +357,14 @@ class Surface(object):
         if join_cap == 'bevel':
             self.context.set_line_join(cairo.LINE_JOIN_BEVEL)
 
+        dashes = []
+        dash_offset = 0
         dash_array = normalize(node.get('stroke-dasharray', '')).split()
         if dash_array:
             dashes = [size(self, dash) for dash in dash_array]
             if sum(dashes):
-                offset = size(self, node.get('stroke-dashoffset'))
-                self.context.set_dash(dashes, offset)
+                dash_offset = size(self, node.get('stroke-dashoffset'))
+                self.context.set_dash(dashes, dash_offset)
 
         miter_limit = float(node.get('stroke-miterlimit', 4))
         self.context.set_miter_limit(miter_limit)
@@ -456,6 +467,18 @@ class Surface(object):
 
             # Stroke
             self.context.save()
+            non_scaling_stroke = (
+                node.tag in NON_SCALING_STROKE_TAGS and
+                node.get('vector-effect', '').strip() == 'non-scaling-stroke')
+            if non_scaling_stroke:
+                # The current path is already stored in device space. Changing
+                # the matrix now only affects stroke construction, which keeps
+                # its width in the root SVG viewport coordinate system.
+                self.context.set_matrix(cairo.Matrix(
+                    self.root_stroke_scale, 0, 0,
+                    self.root_stroke_scale, 0, 0))
+                if dashes:
+                    self.context.set_dash(dashes, dash_offset)
             self.context.set_line_width(
                 size(self, node.get('stroke-width', '1')))
             paint_source, paint_color = paint(node.get('stroke'))
