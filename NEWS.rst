@@ -3,6 +3,12 @@
 ======
 
 
+Version 2.9.2
+=============
+
+* Support ``vector-effect="non-scaling-stroke"`` on ``path``, ``line``,
+  ``polyline`` and ``polygon`` elements for PNG output
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

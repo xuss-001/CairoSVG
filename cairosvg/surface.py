@@ -74,6 +74,9 @@ TAGS = {
 PATH_TAGS = frozenset((
     'circle', 'ellipse', 'line', 'path', 'polygon', 'polyline', 'rect'))
 
+NON_SCALING_STROKE_TAGS = frozenset((
+    'line', 'path', 'polygon', 'polyline'))
+
 INVISIBLE_TAGS = frozenset((
     'clipPath', 'filter', 'linearGradient', 'marker', 'mask', 'pattern',
     'radialGradient', 'symbol'))
@@ -220,6 +223,10 @@ class Surface(object):
         # Initial, non-rounded dimensions
         self.set_context_size(width, height, viewbox, tree)
         self.context.move_to(0, 0)
+        # Matrix of the root viewport, before any transformation applied by
+        # the SVG content itself. Strokes with vector-effect="non-scaling-
+        # stroke" are measured in this coordinate system.
+        self.root_matrix = self.context.get_matrix()
 
         if background_color:
             self.context.set_source_rgba(*color(background_color))
@@ -282,6 +289,67 @@ class Surface(object):
         """Parse a color ``string`` and apply ``map_rgba`` function to it."""
         rgba = color(string, opacity)
         return self.map_rgba(rgba) if self.map_rgba else rgba
+
+    def stroke_path(self, node, line_width):
+        """Stroke the current path.
+
+        When the node defines ``vector-effect="non-scaling-stroke"``, the
+        path geometry still follows the transformations applied to the node
+        and its ancestors, but the stroke width, dashes, caps and joins are
+        computed in the root viewport coordinate system, so that they are
+        neither scaled nor distorted by these transformations.
+
+        """
+        if (node.get('vector-effect') != 'non-scaling-stroke' or
+                node.tag not in NON_SCALING_STROKE_TAGS):
+            self.context.set_line_width(line_width)
+            self.context.stroke()
+            return
+
+        current_matrix = self.context.get_matrix()
+        root_inverse = self.root_matrix.copy()
+        root_inverse.invert()
+        # Maps points of the current path from the root user space to the
+        # user space reached through the node's own transformations.
+        path_matrix = current_matrix.multiply(root_inverse)
+
+        source = self.context.get_source()
+        pattern_matrix = None
+        if hasattr(source, 'get_matrix'):
+            # Gradient and pattern sources bake the current transformation
+            # matrix when they are set on the context. Remember the source
+            # and re-attach it after switching to the root matrix, otherwise
+            # updating its matrix would not take effect.
+            pattern_matrix = source.get_matrix()
+            current_inverse = current_matrix.copy()
+            current_inverse.invert()
+            adjusted_matrix = pattern_matrix.multiply(self.root_matrix)
+            adjusted_matrix = adjusted_matrix.multiply(current_inverse)
+
+        path = self.context.copy_path()
+        self.context.save()
+        self.context.set_matrix(self.root_matrix)
+        if pattern_matrix is not None:
+            source.set_matrix(adjusted_matrix)
+            self.context.set_source(source)
+        mapped_path = []
+        for kind, points in path:
+            pairs = zip(points[0::2], points[1::2])
+            mapped_points = tuple(
+                value for pair in pairs
+                for value in path_matrix.transform_point(*pair))
+            mapped_path.append((kind, mapped_points))
+        self.context.append_path(mapped_path)
+        self.context.set_line_width(line_width)
+        dash = self.context.get_dash()
+        if dash[0]:
+            dashes, offset = dash
+            self.context.set_dash(dashes, offset)
+        self.context.stroke()
+        self.context.restore()
+
+        if pattern_matrix is not None:
+            source.set_matrix(pattern_matrix)
 
     def draw(self, node):
         """Draw ``node`` and its children."""
@@ -456,14 +524,13 @@ class Surface(object):
 
             # Stroke
             self.context.save()
-            self.context.set_line_width(
-                size(self, node.get('stroke-width', '1')))
+            line_width = size(self, node.get('stroke-width', '1'))
             paint_source, paint_color = paint(node.get('stroke'))
             if not gradient_or_pattern(
                     self, node, paint_source, stroke_opacity):
                 self.context.set_source_rgba(
                     *self.map_color(paint_color, stroke_opacity))
-            self.context.stroke()
+            self.stroke_path(node, line_width)
             self.context.restore()
         elif not visible:
             self.context.new_path()
