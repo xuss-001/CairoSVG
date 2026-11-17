@@ -3,6 +3,14 @@
 ======
 
 
+Version 2.9.2 (unreleased)
+====================================
+
+* Add support of ``feGaussianBlur`` applied to ``SourceGraphic``, including
+  separate horizontal and vertical ``stdDeviation`` values, ``filterUnits``
+  and ``primitiveUnits``
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

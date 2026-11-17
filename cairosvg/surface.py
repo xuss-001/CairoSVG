@@ -10,8 +10,9 @@ import cairocffi as cairo
 
 from .colors import color, negate_color
 from .defs import (
-    apply_filter_after_painting, apply_filter_before_painting, clip_path,
-    filter_, gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
+    apply_filter_after_painting, apply_filter_before_painting,
+    apply_gaussian_blur, clip_path, filter_, get_gaussian_blur,
+    gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
     parse_all_defs, pattern, prepare_filter, radial_gradient, use)
 from .helpers import (
     UNITS, PointError, clip_rect, node_format, normalize, paint,
@@ -324,8 +325,10 @@ class Surface(object):
         filter_ = parse_url(node.get('filter')).fragment
         opacity = float(node.get('opacity', 1))
 
+        blur = None
         if filter_:
             prepare_filter(self, node, filter_)
+            blur = get_gaussian_blur(self, node, filter_)
 
         if filter_ or mask or (opacity < 1 and node.children):
             self.context.push_group()
@@ -478,7 +481,10 @@ class Surface(object):
 
         # Apply filter, mask and opacity
         if filter_ or mask or (opacity < 1 and node.children):
-            self.context.pop_group_to_source()
+            if blur:
+                apply_gaussian_blur(self, node, blur)
+            else:
+                self.context.pop_group_to_source()
             if filter_:
                 apply_filter_before_painting(self, node, filter_)
             if mask in self.masks:

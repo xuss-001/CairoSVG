@@ -5,9 +5,13 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+from math import ceil, floor, hypot
+
+from PIL import Image, ImageFilter
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
-from .helpers import paint, size, transform
+from .helpers import normalize, paint, size, transform
 from .parser import Tree
 from .shapes import rect
 from .surface import cairo
@@ -330,6 +334,151 @@ def apply_filter_after_painting(surface, node, name):
                     float(child.get('flood-opacity', 1))))
                 surface.context.fill()
                 surface.context.restore()
+
+
+def parse_std_deviation(value):
+    """Parse the ``stdDeviation`` attribute of a ``feGaussianBlur`` node."""
+    values = normalize(value).split()
+    if len(values) == 1:
+        values *= 2
+    if len(values) != 2:
+        raise ValueError(f'Invalid stdDeviation value: {value!r}')
+    try:
+        std_deviation_x, std_deviation_y = (
+            float(item) for item in values)
+    except ValueError:
+        raise ValueError(f'Invalid stdDeviation value: {value!r}') from None
+    if std_deviation_x < 0 or std_deviation_y < 0:
+        raise ValueError(
+            f'stdDeviation values must be non-negative: {value!r}')
+    return std_deviation_x, std_deviation_y
+
+
+def get_gaussian_blur(surface, node, name):
+    """Return the Gaussian blur parameters of a filter, if any.
+
+    Only a single ``feGaussianBlur`` applied to ``SourceGraphic`` is
+    supported.
+
+    """
+    if 'id' in node and node['id'] in surface.masks:
+        return
+
+    if name not in surface.filters:
+        return
+
+    filter_node = surface.filters[name]
+    for child in filter_node.children:
+        if child.tag == 'feGaussianBlur':
+            source = child.get('in', 'SourceGraphic')
+            if source != 'SourceGraphic':
+                raise ValueError(
+                    f'Unsupported feGaussianBlur input: {source!r}')
+            std_deviation = parse_std_deviation(
+                child.get('stdDeviation', '0'))
+            return filter_node, std_deviation
+
+
+def filter_region(surface, node, filter_node):
+    """Return the filter region ``(x, y, width, height)`` in user units."""
+    if filter_node.get('filterUnits') == 'userSpaceOnUse':
+        return (
+            size(surface, filter_node.get('x', '-10%'), 'x'),
+            size(surface, filter_node.get('y', '-10%'), 'y'),
+            size(surface, filter_node.get('width', '120%'), 'x'),
+            size(surface, filter_node.get('height', '120%'), 'y'))
+    bounding_box = calculate_bounding_box(surface, node)
+    if not is_non_empty_bounding_box(bounding_box):
+        return None
+    x, y, width, height = bounding_box
+    return (
+        x + size(surface, filter_node.get('x', '-10%'), 1) * width,
+        y + size(surface, filter_node.get('y', '-10%'), 1) * height,
+        size(surface, filter_node.get('width', '120%'), 1) * width,
+        size(surface, filter_node.get('height', '120%'), 1) * height)
+
+
+def blur_image_surface(image_surface, radius_x, radius_y):
+    """Apply a Gaussian blur to an ARGB32 image surface, in place."""
+    if radius_x <= 0 and radius_y <= 0:
+        return
+    width = image_surface.get_width()
+    height = image_surface.get_height()
+    if width <= 0 or height <= 0:
+        return
+    image_surface.flush()
+    data = image_surface.get_data()
+    # Cairo stores premultiplied BGRA values: blurring each channel
+    # independently gives correct colors and transparency, with no dark
+    # fringes on transparent edges.
+    image = Image.frombuffer(
+        'RGBA', (width, height), data, 'raw', 'BGRA', 0, 1)
+    image = image.filter(ImageFilter.GaussianBlur((radius_x, radius_y)))
+    data[:] = image.tobytes('raw', 'BGRA')
+    image_surface.mark_dirty()
+
+
+def apply_gaussian_blur(surface, node, blur):
+    """Pop the painted group, blur it, and set it as the current source."""
+    filter_node, (std_deviation_x, std_deviation_y) = blur
+    context = surface.context
+    matrix = context.get_matrix()
+
+    # stdDeviation is expressed in primitive units
+    if filter_node.get('primitiveUnits') == 'objectBoundingBox':
+        bounding_box = calculate_bounding_box(surface, node)
+        if is_non_empty_bounding_box(bounding_box):
+            std_deviation_x *= bounding_box[2]
+            std_deviation_y *= bounding_box[3]
+        else:
+            std_deviation_x = std_deviation_y = 0
+
+    region = filter_region(surface, node, filter_node)
+    if region is None:
+        context.pop_group()
+        return
+    region_x, region_y, region_width, region_height = region
+
+    # Geometry in device pixels, so that transforms and output scales are
+    # taken into account
+    corners = tuple(
+        matrix.transform_point(x, y) for x, y in (
+            (region_x, region_y),
+            (region_x + region_width, region_y),
+            (region_x, region_y + region_height),
+            (region_x + region_width, region_y + region_height)))
+    min_x = floor(min(point[0] for point in corners))
+    min_y = floor(min(point[1] for point in corners))
+    width = ceil(max(point[0] for point in corners)) - min_x
+    height = ceil(max(point[1] for point in corners)) - min_y
+    scale_x = hypot(matrix.xx, matrix.yx)
+    scale_y = hypot(matrix.xy, matrix.yy)
+
+    group_pattern = context.pop_group()
+    if width <= 0 or height <= 0:
+        return
+
+    # Paint the group on a transparent image surface, clipped to the
+    # filter region
+    image_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    image_matrix = cairo.Matrix(
+        matrix.xx, matrix.yx, matrix.xy, matrix.yy,
+        matrix.x0 - min_x, matrix.y0 - min_y)
+    image_context = cairo.Context(image_surface)
+    image_context.set_matrix(image_matrix)
+    image_context.set_source(group_pattern)
+    image_context.rectangle(
+        region_x, region_y, region_width, region_height)
+    image_context.clip()
+    image_context.paint()
+
+    blur_image_surface(
+        image_surface, std_deviation_x * scale_x, std_deviation_y * scale_y)
+
+    # Use the blurred image as source on the original context
+    pattern = cairo.SurfacePattern(image_surface)
+    pattern.set_matrix(image_matrix)
+    context.set_source(pattern)
 
 
 def use(surface, node):

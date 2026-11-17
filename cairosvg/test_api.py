@@ -10,6 +10,7 @@ import sys
 
 import cairocffi as cairo
 import pytest
+from PIL import Image
 
 from . import SURFACES, VERSION, parser, surface, svg2pdf, svg2png
 from .__main__ import main
@@ -191,3 +192,216 @@ def test_script(tmp_path):
     # Explicit -f wins
     assert not test_main([svg_filename, '-o', str(temp_3), '-f', 'pdf'])
     assert read_file(str(temp_3))[:100] == expected_pdf
+
+
+def png_to_pixels(png_bytes):
+    """Return a PIL image in RGBA mode from PNG bytes."""
+    return Image.open(io.BytesIO(png_bytes)).convert('RGBA')
+
+
+BLUR_SVG = b'''\
+<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="3"/>
+    </filter>
+  </defs>
+  <rect x="25" y="25" width="50" height="50" fill="red"
+        filter="url(#blur)"/>
+</svg>
+'''
+
+
+def test_gaussian_blur():
+    """A Gaussian blur softens the edges of a shape."""
+    image = png_to_pixels(svg2png(BLUR_SVG))
+    assert image.size == (100, 100)
+    # The center of the shape is untouched
+    assert image.getpixel((50, 50)) == (255, 0, 0, 255)
+    # The edge of the shape is half-transparent
+    red, green, blue, alpha = image.getpixel((25, 50))
+    assert 100 < alpha < 180
+    # The blur leaks outside of the original shape…
+    assert 0 < image.getpixel((22, 50))[3] < 255
+    # …but not outside of the filter region (110% of the bounding box)
+    assert image.getpixel((10, 50))[3] == 0
+    assert image.getpixel((0, 0))[3] == 0
+
+
+def test_gaussian_blur_transparent_edges():
+    """Blurred transparent edges keep their color, without dark fringes."""
+    image = png_to_pixels(svg2png(BLUR_SVG))
+    for position in ((25, 50), (22, 50), (50, 25), (75, 50)):
+        red, green, blue, alpha = image.getpixel(position)
+        assert 0 < alpha < 255
+        assert red == 255
+        assert green == 0
+        assert blue == 0
+
+
+def test_gaussian_blur_anisotropic():
+    """stdDeviation controls horizontal and vertical blur separately."""
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="4 0"/>
+    </filter>
+  </defs>
+  <rect x="25" y="25" width="50" height="50" fill="lime"
+        filter="url(#blur)"/>
+</svg>'''))
+    # Horizontal blur only: soft left/right edges, sharp top/bottom edges
+    assert 0 < image.getpixel((22, 50))[3] < 255
+    assert image.getpixel((50, 24))[3] == 0
+    assert image.getpixel((50, 26))[3] == 255
+
+    # Same test with vertical blur only
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="0 4"/>
+    </filter>
+  </defs>
+  <rect x="25" y="25" width="50" height="50" fill="lime"
+        filter="url(#blur)"/>
+</svg>'''))
+    assert 0 < image.getpixel((50, 22))[3] < 255
+    assert image.getpixel((24, 50))[3] == 0
+    assert image.getpixel((26, 50))[3] == 255
+
+
+def test_gaussian_blur_group_opacity():
+    """A group is blurred as a whole, opacity is only applied once."""
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="2"/>
+    </filter>
+  </defs>
+  <g filter="url(#blur)" opacity="0.5">
+    <rect x="20" y="20" width="20" height="20" fill="red"/>
+    <rect x="60" y="60" width="20" height="20" fill="blue"/>
+  </g>
+</svg>'''))
+    # Both children are blurred, with 0.5 opacity applied once
+    assert image.getpixel((30, 30)) == (255, 0, 0, 128)
+    assert image.getpixel((70, 70)) == (0, 0, 255, 128)
+    assert 0 < image.getpixel((19, 30))[3] < 128
+
+
+def test_gaussian_blur_shared_filter():
+    """Objects sharing the same filter are blurred independently."""
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="2"/>
+    </filter>
+  </defs>
+  <rect x="10" y="10" width="20" height="20" fill="red"
+        filter="url(#blur)"/>
+  <rect x="60" y="60" width="20" height="20" fill="red"
+        filter="url(#blur)"/>
+</svg>'''))
+    assert image.getpixel((20, 20)) == (255, 0, 0, 255)
+    assert image.getpixel((70, 70)) == (255, 0, 0, 255)
+    # Corresponding edge pixels of both shapes get the same blur
+    assert image.getpixel((10, 20)) == image.getpixel((60, 70))
+    assert 0 < image.getpixel((10, 20))[3] < 255
+
+
+def test_gaussian_blur_filter_region():
+    """The blur is clipped to the filter region."""
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur" filterUnits="userSpaceOnUse"
+            x="0" y="0" width="60" height="60">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+  <rect x="25" y="25" width="50" height="50" fill="red"
+        filter="url(#blur)"/>
+</svg>'''))
+    assert image.getpixel((55, 50))[3] > 0
+    assert image.getpixel((61, 50))[3] == 0
+    assert image.getpixel((70, 70))[3] == 0
+
+
+def test_gaussian_blur_primitive_units():
+    """stdDeviation can be expressed in object bounding box units."""
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur" primitiveUnits="objectBoundingBox">
+      <feGaussianBlur stdDeviation="0.06"/>
+    </filter>
+  </defs>
+  <rect x="25" y="25" width="50" height="50" fill="red"
+        filter="url(#blur)"/>
+</svg>'''))
+    # 0.06 * 50 = 3 user units: same result as stdDeviation="3"
+    reference = png_to_pixels(svg2png(BLUR_SVG))
+    assert image.getpixel((25, 50)) == reference.getpixel((25, 50))
+    assert image.getpixel((22, 50)) == reference.getpixel((22, 50))
+
+
+def test_gaussian_blur_scale():
+    """The blur radius follows the output scale."""
+    image_1 = png_to_pixels(svg2png(BLUR_SVG))
+    image_2 = png_to_pixels(svg2png(BLUR_SVG, scale=2))
+    assert image_1.size == (100, 100)
+    assert image_2.size == (200, 200)
+    # A pixel 3 units away from the edge gets the same blur at both scales
+    alpha_1 = image_1.getpixel((22, 50))[3]
+    alpha_2 = image_2.getpixel((44, 100))[3]
+    assert abs(alpha_1 - alpha_2) < 20
+    assert image_2.getpixel((100, 100)) == (255, 0, 0, 255)
+
+
+def test_gaussian_blur_transform():
+    """The blur radius follows the object transform."""
+    image = png_to_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="2"/>
+    </filter>
+  </defs>
+  <rect x="10" y="10" width="20" height="20" fill="red"
+        filter="url(#blur)" transform="translate(30 30) scale(2)"/>
+</svg>'''))
+    assert image.getpixel((70, 70)) == (255, 0, 0, 255)
+    # The edge is at 30 + 10 * 2 = 50
+    assert 100 < image.getpixel((50, 70))[3] < 180
+
+
+def test_gaussian_blur_invalid():
+    """Invalid blur parameters raise an error."""
+    template = '''\
+<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+  <defs>
+    <filter id="blur">
+      <feGaussianBlur {attributes}/>
+    </filter>
+  </defs>
+  <rect width="10" height="10" filter="url(#blur)"/>
+</svg>'''
+    for attributes in (
+            'stdDeviation="abc"', 'stdDeviation="-2"', 'stdDeviation="1 2 3"',
+            'in="BackgroundImage" stdDeviation="2"'):
+        with pytest.raises(ValueError):
+            svg2png(template.format(attributes=attributes).encode())
+
+
+def test_gaussian_blur_no_filter_regression():
+    """Images without blur filters are left untouched."""
+    assert svg2png(SVG_SAMPLE).startswith(MAGIC_NUMBERS['PNG'])
+    image = png_to_pixels(svg2png(SVG_SAMPLE))
+    # The rectangle keeps sharp edges
+    assert image.getpixel((6, 11))[3] == 255
+    assert image.getpixel((2, 11))[3] == 0
