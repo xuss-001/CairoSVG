@@ -10,8 +10,9 @@ import cairocffi as cairo
 
 from .colors import color, negate_color
 from .defs import (
-    apply_filter_after_painting, apply_filter_before_painting, clip_path,
-    filter_, gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
+    apply_filter_after_painting, apply_filter_before_painting,
+    apply_gaussian_blur, clip_path, filter_, gaussian_blur_filter,
+    gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
     parse_all_defs, pattern, prepare_filter, radial_gradient, use)
 from .helpers import (
     UNITS, PointError, clip_rect, node_format, normalize, paint,
@@ -323,6 +324,7 @@ class Surface(object):
         mask = parse_url(node.get('mask')).fragment
         filter_ = parse_url(node.get('filter')).fragment
         opacity = float(node.get('opacity', 1))
+        _, blur_filter = gaussian_blur_filter(self, filter_)
 
         if filter_:
             prepare_filter(self, node, filter_)
@@ -414,7 +416,7 @@ class Surface(object):
         # Get stroke and fill opacity
         stroke_opacity = float(node.get('stroke-opacity', 1))
         fill_opacity = float(node.get('fill-opacity', 1))
-        if opacity < 1 and not node.children:
+        if opacity < 1 and not node.children and not blur_filter:
             stroke_opacity *= opacity
             fill_opacity *= opacity
 
@@ -478,13 +480,20 @@ class Surface(object):
 
         # Apply filter, mask and opacity
         if filter_ or mask or (opacity < 1 and node.children):
-            self.context.pop_group_to_source()
-            if filter_:
-                apply_filter_before_painting(self, node, filter_)
-            if mask in self.masks:
-                paint_mask(self, node, mask, opacity)
+            if blur_filter:
+                pattern = self.context.pop_group()
+                if filter_:
+                    apply_filter_before_painting(self, node, filter_)
+                apply_gaussian_blur(
+                    self, node, filter_, pattern, opacity, mask)
             else:
-                self.context.paint_with_alpha(opacity)
+                self.context.pop_group_to_source()
+                if filter_:
+                    apply_filter_before_painting(self, node, filter_)
+                if mask in self.masks:
+                    paint_mask(self, node, mask, opacity)
+                else:
+                    self.context.paint_with_alpha(opacity)
             if filter_:
                 apply_filter_after_painting(self, node, filter_)
 

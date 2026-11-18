@@ -5,6 +5,11 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+import sys
+from math import hypot, isfinite
+
+from PIL import Image, ImageFilter
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
 from .helpers import paint, size, transform
@@ -330,6 +335,193 @@ def apply_filter_after_painting(surface, node, name):
                     float(child.get('flood-opacity', 1))))
                 surface.context.fill()
                 surface.context.restore()
+
+
+def gaussian_blur_filter(surface, name):
+    """Return the filter and blur nodes for ``name``, if any."""
+    filter_node = surface.filters.get(name)
+    if filter_node is not None:
+        for child in filter_node.children:
+            if child.tag == 'feGaussianBlur':
+                return filter_node, child
+    return None, None
+
+
+def _parse_std_deviation(blur_node):
+    """Parse and validate a ``stdDeviation`` attribute."""
+    string = blur_node.get('stdDeviation', '0')
+    values = string.replace(',', ' ').split()
+    if len(values) == 1:
+        values *= 2
+    elif len(values) != 2:
+        raise ValueError(
+            'feGaussianBlur stdDeviation must contain one or two numbers')
+
+    try:
+        deviations = tuple(float(value) for value in values)
+    except ValueError as exception:
+        raise ValueError(
+            'feGaussianBlur stdDeviation must contain numbers') from exception
+
+    if not all(isfinite(value) for value in deviations):
+        raise ValueError('feGaussianBlur stdDeviation must be finite')
+    if any(value < 0 for value in deviations):
+        raise ValueError('feGaussianBlur stdDeviation must not be negative')
+    return deviations
+
+
+def _cairo_surface_to_image(surface):
+    """Convert a Cairo ARGB32 surface to a Pillow image."""
+    surface.flush()
+    stride = surface.get_stride()
+    data = bytearray(surface.get_data())
+    raw_mode = 'BGRA' if sys.byteorder == 'little' else 'ARGB'
+    image = Image.frombuffer(
+        'RGBA', (surface.get_width(), surface.get_height()), data, 'raw',
+        raw_mode, stride, 1)
+    return image, raw_mode
+
+
+def _image_to_cairo_surface(image, raw_mode, stride):
+    """Convert a Pillow image back to a Cairo ARGB32 surface."""
+    data = bytearray(image.tobytes('raw', raw_mode))
+    return cairo.ImageSurface.create_for_data(
+        data, cairo.FORMAT_ARGB32, image.width, image.height, stride)
+
+
+def _source_bounding_box(pattern, image):
+    """Get the source bounding box in the current user coordinate system."""
+    bounding_box = image.getbbox()
+    if not bounding_box:
+        return None
+
+    matrix = pattern.get_matrix().copy()
+    try:
+        matrix.invert()
+    except cairo.Error:
+        return None
+
+    left, top, right, bottom = bounding_box
+    if abs(matrix.xy) < 1e-9 and abs(matrix.yx) < 1e-9:
+        points = (
+            matrix.transform_point(left, top),
+            matrix.transform_point(right, top),
+            matrix.transform_point(left, bottom),
+            matrix.transform_point(right, bottom))
+    else:
+        points = []
+        alpha = image.getchannel('A').tobytes()
+        width = image.width
+        for y in range(top, bottom):
+            row = y * width
+            for x in range(left, right):
+                if alpha[row + x]:
+                    points.extend((
+                        matrix.transform_point(x, y),
+                        matrix.transform_point(x + 1, y),
+                        matrix.transform_point(x, y + 1),
+                        matrix.transform_point(x + 1, y + 1)))
+    if not points:
+        return None
+    x_values, y_values = zip(*points)
+    min_x, min_y = min(x_values), min(y_values)
+    return min_x, min_y, max(x_values) - min_x, max(y_values) - min_y
+
+
+def _resolve_filter_length(surface, value, reference, axis, bbox):
+    """Resolve a filter region length in object or user units."""
+    if bbox is None:
+        return size(surface, value, axis)
+    if value.strip().endswith('%'):
+        return size(surface, value, reference)
+    return size(surface, value, 1) * reference
+
+
+def _filter_region(surface, filter_node, bounding_box):
+    """Get the filter region as ``(x, y, width, height)`` in user units."""
+    filter_units = filter_node.get('filterUnits', 'objectBoundingBox')
+    values = {
+        'x': filter_node.get('x', '-10%'),
+        'y': filter_node.get('y', '-10%'),
+        'width': filter_node.get('width', '120%'),
+        'height': filter_node.get('height', '120%'),
+    }
+
+    if filter_units == 'userSpaceOnUse':
+        return (
+            size(surface, values['x'], 'x'),
+            size(surface, values['y'], 'y'),
+            size(surface, values['width'], 'x'),
+            size(surface, values['height'], 'y'))
+
+    if bounding_box is None:
+        return None
+    x, y, width, height = bounding_box
+    return (
+        x + _resolve_filter_length(
+            surface, values['x'], width, 'x', bounding_box),
+        y + _resolve_filter_length(
+            surface, values['y'], height, 'y', bounding_box),
+        _resolve_filter_length(
+            surface, values['width'], width, 'x', bounding_box),
+        _resolve_filter_length(
+            surface, values['height'], height, 'y', bounding_box))
+
+
+def apply_gaussian_blur(surface, node, name, pattern, opacity, mask):
+    """Blur a painted group and draw the filtered result."""
+    filter_node, blur_node = gaussian_blur_filter(surface, name)
+    if blur_node is None:
+        return False
+
+    source_surface = pattern.get_surface()
+    if not isinstance(source_surface, cairo.ImageSurface):
+        surface.context.set_source(pattern)
+        if mask in surface.masks:
+            paint_mask(surface, node, mask, opacity)
+        else:
+            surface.context.paint_with_alpha(opacity)
+        return True
+
+    deviations = _parse_std_deviation(blur_node)
+    image, raw_mode = _cairo_surface_to_image(source_surface)
+    bounding_box = _source_bounding_box(pattern, image)
+
+    if filter_node.get('primitiveUnits') == 'objectBoundingBox':
+        if bounding_box is None:
+            return True
+        deviations = (
+            deviations[0] * bounding_box[2],
+            deviations[1] * bounding_box[3])
+
+    matrix = surface.context.get_matrix()
+    deviations = (
+        deviations[0] * hypot(matrix.xx, matrix.yx),
+        deviations[1] * hypot(matrix.xy, matrix.yy))
+
+    if deviations[0] or deviations[1]:
+        image = image.filter(ImageFilter.GaussianBlur(deviations))
+        blurred_surface = _image_to_cairo_surface(
+            image, raw_mode, source_surface.get_stride())
+        blurred_pattern = cairo.SurfacePattern(blurred_surface)
+        blurred_pattern.set_matrix(pattern.get_matrix())
+    else:
+        blurred_pattern = pattern
+
+    region = _filter_region(surface, filter_node, bounding_box)
+    if region is None or region[2] <= 0 or region[3] <= 0:
+        return True
+
+    surface.context.save()
+    surface.context.set_source(blurred_pattern)
+    surface.context.rectangle(*region)
+    surface.context.clip()
+    if mask in surface.masks:
+        paint_mask(surface, node, mask, opacity)
+    else:
+        surface.context.paint_with_alpha(opacity)
+    surface.context.restore()
+    return True
 
 
 def use(surface, node):
