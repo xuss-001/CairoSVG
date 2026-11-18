@@ -6,7 +6,8 @@ Shapes drawers.
 from collections import deque
 from math import pi
 
-from .helpers import normalize, point, point_angle, size
+from .helpers import normalize, point, size
+from .path import CLOSED_SUBPATH, SegmentAngles, tangent_angle
 
 
 def circle(surface, node):
@@ -47,14 +48,26 @@ def line(surface, node):
         for position in ('x1', 'y1', 'x2', 'y2'))
     surface.context.move_to(x1, y1)
     surface.context.line_to(x2, y2)
-    angle = point_angle(x1, y1, x2, y2)
-    node.vertices = deque([(x1, y1), (pi - angle, angle), (x2, y2)])
+    angle = tangent_angle(x1, y1, x2, y2)
+    node.vertices = deque(
+        [(x1, y1), SegmentAngles((angle, angle)), (x2, y2)])
 
 
 def polygon(surface, node):
     """Draw a polygon ``node`` on ``surface``."""
     polyline(surface, node)
     surface.context.close_path()
+    if node.vertices:
+        # The closing segment joins the last vertex back to the first one.
+        # ``CLOSED_SUBPATH`` marks the sub-path as closed so its first vertex
+        # gets a mid marker and no end marker is drawn; the first vertex is
+        # not stored a second time.
+        first_point = node.vertices[0]
+        last_point = node.vertices[-1]
+        angle = tangent_angle(*last_point, *first_point)
+        if angle is not None:
+            node.vertices.append(SegmentAngles((angle, angle)))
+        node.vertices.append(CLOSED_SUBPATH)
 
 
 def polyline(surface, node):
@@ -67,8 +80,8 @@ def polyline(surface, node):
         while points:
             x_old, y_old = x, y
             x, y, points = point(surface, points)
-            angle = point_angle(x_old, y_old, x, y)
-            node.vertices.append((pi - angle, angle))
+            angle = tangent_angle(x_old, y_old, x, y)
+            node.vertices.append(SegmentAngles((angle, angle)))
             surface.context.line_to(x, y)
             node.vertices.append((x, y))
 

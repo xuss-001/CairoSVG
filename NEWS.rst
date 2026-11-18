@@ -3,6 +3,19 @@
 ======
 
 
+Version 2.9.2
+=============
+
+* Fix the automatic orientation (``auto`` and ``auto-start-reverse``) of
+  ``marker-start``, ``marker-mid`` and ``marker-end`` markers on paths:
+  open vertices follow the path tangent, internal vertices use the SVG
+  incoming/outgoing bisector, and angles close to +/- 180 degrees no longer
+  flip. Lines, quadratic and cubic Bézier curves, smooth curves, rotated
+  elliptical arcs, relative commands, closed paths and multiple sub-paths
+  are handled, and zero-length segments and fully degenerate sub-paths no
+  longer crash or lose their markers.
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 
