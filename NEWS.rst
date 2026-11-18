@@ -3,6 +3,15 @@
 ======
 
 
+Unreleased
+==========
+
+* Support explicit ``luminance`` and ``alpha`` values for ``mask-type`` in PNG
+  output
+* Fix mask regions, content units and repeated mask references
+* Don’t apply object opacity twice when an object is masked
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

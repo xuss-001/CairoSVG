@@ -14,6 +14,15 @@ CairoSVG has been created and developed by Kozea (https://kozea.fr).
 Professional support, maintenance and community management is provided by
 CourtBouillon (https://www.courtbouillon.org).
 
+Masking
+-------
+
+PNG output supports the SVG ``mask-type`` property on ``mask`` elements.
+``mask-type="luminance"`` combines the luminance of the mask colors with their
+opacity, while ``mask-type="alpha"`` uses opacity only. When ``mask-type`` is
+not specified, CairoSVG keeps its historical alpha-mask behavior. PDF, PS and
+EPS output continue to use alpha masks.
+
 Copyrights are retained by their contributors, no copyright assignment is
 required to contribute to CairoSVG. Unless explicitly stated otherwise, any
 contribution intentionally submitted for inclusion is licensed under the LGPL 
