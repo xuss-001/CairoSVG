@@ -3,6 +3,19 @@
 ======
 
 
+Unreleased
+==========
+
+* Support the ``textLength`` and ``lengthAdjust`` attributes on ``text`` and
+  ``tspan`` elements for horizontal left-to-right text. The default
+  ``spacing`` mode distributes the adjustment over the inter-glyph advances
+  while ``spacingAndGlyphs`` also scales the glyph outlines horizontally.
+  Lengths are based on typographic advance widths (font metrics), nested
+  ``tspan`` elements keep their own target length, and ``text-anchor`` is
+  applied to the adjusted text. Unitless, ``px`` and ``em`` lengths are
+  accepted; invalid lengths and unknown adjustment modes fall back to the
+  legacy text layout.
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 
