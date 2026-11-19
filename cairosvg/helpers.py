@@ -4,7 +4,8 @@ Surface helpers.
 """
 
 import re
-from math import atan2, cos, hypot, radians, sin, tan
+from collections import deque, namedtuple
+from math import atan2, cos, hypot, isfinite, radians, sin, tan
 
 from .surface import cairo
 from .url import parse_url
@@ -95,6 +96,196 @@ def point(surface, string):
 def point_angle(cx, cy, px, py):
     """Return angle between x axis and point knowing given center."""
     return atan2(py - cy, px - cx)
+
+
+MarkerVertex = namedtuple('MarkerVertex', 'point angle position')
+_MarkerSegment = namedtuple(
+    '_MarkerSegment', 'start end outgoing incoming')
+_EPSILON = 1e-12
+
+
+def _unit_vector(vector):
+    """Return ``vector`` with a length of one, or ``None`` if it is zero."""
+    if vector is None:
+        return None
+    x, y = vector
+    length = hypot(x, y)
+    if not isfinite(length) or length <= _EPSILON:
+        return None
+    return x / length, y / length
+
+
+def _direction(start, end):
+    """Return the unit vector going from ``start`` to ``end``."""
+    return _unit_vector((end[0] - start[0], end[1] - start[1]))
+
+
+def _first_direction(start, points):
+    """Return the first non-zero direction from ``start`` to ``points``."""
+    for end in points:
+        direction = _direction(start, end)
+        if direction is not None:
+            return direction
+    return None
+
+
+def _first_incoming_direction(end, points):
+    """Return the first non-zero direction from ``points`` to ``end``."""
+    for start in points:
+        direction = _direction(start, end)
+        if direction is not None:
+            return direction
+    return None
+
+
+def _angle(vector):
+    """Return the angle of a vector, in radians."""
+    return atan2(vector[1], vector[0])
+
+
+def _marker_angle(incoming, outgoing):
+    """Return the auto orientation for a marker vertex.
+
+    Incoming and outgoing directions are travel directions.  Adding their
+    unit vectors gives the angle bisector without wrapping around at +/-pi.
+    """
+    if incoming is not None and outgoing is not None:
+        bisector = _unit_vector((
+            incoming[0] + outgoing[0], incoming[1] + outgoing[1]))
+        if bisector is not None:
+            return _angle(bisector)
+        # Exactly opposite directions have no geometric bisector.  Keep the
+        # marker going forward along the outgoing segment instead of letting
+        # rounding decide between two opposite orientations.
+        return _angle(outgoing)
+    if outgoing is not None:
+        return _angle(outgoing)
+    if incoming is not None:
+        return _angle(incoming)
+    return 0
+
+
+class _MarkerSubpath:
+    """Geometry of one path subpath, used to place its markers."""
+
+    def __init__(self, start):
+        self.start = start
+        self.end = start
+        self.segments = []
+        self.closed = False
+
+
+class MarkerBuilder:
+    """Collect path geometry and build marker vertices from it."""
+
+    def __init__(self):
+        self.subpaths = []
+        self.current = None
+
+    def move_to(self, point):
+        """Start a new subpath at ``point``."""
+        self.current = _MarkerSubpath(point)
+        self.subpaths.append(self.current)
+
+    def _open_subpath(self, point):
+        if self.current is None or self.current.closed:
+            self.move_to(point)
+
+    def segment(self, start, end, outgoing=None, incoming=None):
+        """Add a segment with optional raw endpoint tangent vectors."""
+        self._open_subpath(start)
+        self.current.segments.append(_MarkerSegment(
+            start, end, _unit_vector(outgoing), _unit_vector(incoming)))
+        self.current.end = end
+
+    def line_to(self, start, end):
+        """Add a straight segment."""
+        direction = _direction(start, end)
+        self.segment(start, end, direction, direction)
+
+    def cubic_to(self, start, control1, control2, end):
+        """Add a cubic Bézier segment."""
+        self.segment(
+            start, end,
+            _first_direction(start, (control1, control2, end)),
+            _first_incoming_direction(
+                end, (control2, control1, start)))
+
+    def quadratic_to(self, start, control, end):
+        """Add a quadratic Bézier segment."""
+        self.segment(
+            start, end,
+            _first_direction(start, (control, end)),
+            _first_incoming_direction(end, (control, start)))
+
+    def close(self, point=None):
+        """Close the current subpath with a straight segment."""
+        if self.current is None:
+            self.move_to(point or (0, 0))
+        if self.current.closed:
+            return
+        point = self.current.end if point is None else point
+        direction = _direction(point, self.current.start)
+        self.current.segments.append(_MarkerSegment(
+            point, self.current.start, direction, direction))
+        self.current.end = self.current.start
+        self.current.closed = True
+
+    def _subpath_vertices(self, subpath):
+        segments = subpath.segments
+        if not segments:
+            return [
+                MarkerVertex(subpath.start, 0, 'start'),
+                MarkerVertex(subpath.start, 0, 'end')]
+
+        incoming = [segment.incoming for segment in segments]
+        outgoing = [segment.outgoing for segment in segments]
+        last = len(segments) - 1
+
+        # Cache the nearest non-degenerate direction on each side of every
+        # vertex, so that paths with many zero-length segments stay linear.
+        incoming_before = []
+        direction = None
+        for segment_direction in incoming:
+            direction = segment_direction or direction
+            incoming_before.append(direction)
+        outgoing_after = [None] * len(segments)
+        direction = None
+        for index in range(last, -1, -1):
+            direction = outgoing[index] or direction
+            outgoing_after[index] = direction
+
+        vertices = []
+
+        start_direction = (
+            outgoing_after[0] or incoming_before[last])
+        vertices.append(MarkerVertex(
+            subpath.start, _marker_angle(None, start_direction), 'start'))
+
+        for index in range(1, len(segments)):
+            vertices.append(MarkerVertex(
+                segments[index].start,
+                _marker_angle(
+                    incoming_before[index - 1], outgoing_after[index]),
+                'mid'))
+
+        if subpath.closed:
+            end_point = subpath.start
+            end_direction = (
+                incoming_before[last] or outgoing_after[0])
+        else:
+            end_point = segments[-1].end
+            end_direction = incoming_before[last]
+        vertices.append(MarkerVertex(
+            end_point, _marker_angle(end_direction, None), 'end'))
+        return vertices
+
+    def vertices(self):
+        """Return all marker vertices as a deque of named tuples."""
+        vertices = []
+        for subpath in self.subpaths:
+            vertices.extend(self._subpath_vertices(subpath))
+        return deque(vertices)
 
 
 def preserve_ratio(surface, node, width=None, height=None):

@@ -4,13 +4,13 @@ Paths manager.
 """
 
 from collections import deque
-from math import copysign, hypot, pi, radians
+from math import cos, hypot, radians, sin
 from re import finditer
 
 from .bounding_box import calculate_bounding_box
 from .helpers import (
-    PATH_LETTERS, clip_marker_box, node_format, normalize, point, point_angle,
-    preserve_ratio, quadratic_points, rotate, size)
+    PATH_LETTERS, MarkerBuilder, clip_marker_box, node_format, normalize,
+    point, point_angle, preserve_ratio, quadratic_points, rotate, size)
 from .url import parse_url
 
 
@@ -28,27 +28,15 @@ def draw_markers(surface, node):
         else:
             markers[position] = common_marker
 
-    angle1, angle2 = None, None
-    position = 'start'
-
-    while node.vertices:
-        # Calculate position and angle
-        point = node.vertices.popleft()
-        angles = node.vertices.popleft() if node.vertices else None
-        if angles:
-            if position == 'start':
-                angle = pi - angles[0]
-            else:
-                angle = (angle2 + pi - angles[0]) / 2
-            angle1, angle2 = angles
-        else:
-            angle = angle2
-            position = 'end'
+    for vertex in node.vertices:
+        point, angle, position = vertex
 
         # Draw marker (if a marker exists for 'position')
         marker = markers[position]
         if marker:
             marker_node = surface.markers.get(marker)
+            if marker_node is None:
+                continue
 
             # Calculate scale based on current stroke (if requested)
             if marker_node.get('markerUnits') == 'userSpaceOnUse':
@@ -117,14 +105,14 @@ def draw_markers(surface, node):
 
             surface.context.append_path(temp_path)
 
-        position = 'mid' if angles else 'start'
-
 
 def path(surface, node):
     """Draw a path ``node``."""
     string = node.get('d', '')
 
-    node.vertices = deque()
+    marker_builder = MarkerBuilder()
+    cubic_control = None
+    quadratic_control = None
 
     for letter in PATH_LETTERS:
         string = string.replace(letter, f' {letter} ')
@@ -147,7 +135,6 @@ def path(surface, node):
         string = string.strip()
 
         if last_letter in (None, 'z', 'Z') and letter not in 'mM':
-            node.vertices.append(current_point)
             first_path_point = current_point
 
         if last_letter in (None, 'm', 'M', 'z', 'Z'):
@@ -230,8 +217,23 @@ def path(surface, node):
             angle1 = point_angle(xc, yc, 0, 0)
             angle2 = point_angle(xc, yc, xe, ye)
 
-            # Store the tangent angles
-            node.vertices.append((-angle1, -angle2))
+            # Find the tangents in user coordinates, including rotation and
+            # the non-uniform scale used to draw the ellipse.
+            start_tangent = rotate(
+                -rx * sin(angle1), rx * cos(angle1) * radii_ratio, rotation)
+            end_tangent = rotate(
+                -rx * sin(angle2), rx * cos(angle2) * radii_ratio, rotation)
+            if not sweep:
+                start_tangent = -start_tangent[0], -start_tangent[1]
+                end_tangent = -end_tangent[0], -end_tangent[1]
+            new_point = current_point[0] + x3, current_point[1] + y3
+            if hypot(
+                    new_point[0] - current_point[0],
+                    new_point[1] - current_point[1]) <= 1e-12:
+                # SVG omits an arc whose endpoints are identical.
+                start_tangent = end_tangent = None
+            marker_builder.segment(
+                current_point, new_point, start_tangent, end_tangent)
 
             # Draw the arc
             surface.context.save()
@@ -240,7 +242,7 @@ def path(surface, node):
             surface.context.scale(1, radii_ratio)
             arc(xc, yc, rx, angle1, angle2)
             surface.context.restore()
-            current_point = current_point[0] + x3, current_point[1] + y3
+            current_point = new_point
 
         elif letter == 'c':
             # Relative curve
@@ -248,10 +250,14 @@ def path(surface, node):
             x1, y1, string = point(surface, string)
             x2, y2, string = point(surface, string)
             x3, y3, string = point(surface, string)
-            node.vertices.append((
-                point_angle(x2, y2, x1, y1), point_angle(x2, y2, x3, y3)))
+            control1 = x + x1, y + y1
+            control2 = x + x2, y + y2
+            new_point = x + x3, y + y3
+            marker_builder.cubic_to(
+                current_point, control1, control2, new_point)
+            cubic_control = control2
             surface.context.rel_curve_to(x1, y1, x2, y2, x3, y3)
-            current_point = current_point[0] + x3, current_point[1] + y3
+            current_point = new_point
 
             # Save absolute values for x and y, useful if next letter is s or S
             x1 += x
@@ -266,85 +272,92 @@ def path(surface, node):
             x1, y1, string = point(surface, string)
             x2, y2, string = point(surface, string)
             x3, y3, string = point(surface, string)
-            node.vertices.append((
-                point_angle(x2, y2, x1, y1), point_angle(x2, y2, x3, y3)))
+            control1 = x1, y1
+            control2 = x2, y2
+            new_point = x3, y3
+            marker_builder.cubic_to(
+                current_point, control1, control2, new_point)
+            cubic_control = control2
             surface.context.curve_to(x1, y1, x2, y2, x3, y3)
-            current_point = x3, y3
+            current_point = new_point
 
         elif letter == 'h':
             # Relative horizontal line
             x, string = (string + ' ').split(' ', 1)
             old_x, old_y = current_point
-            angle = 0 if size(surface, x, 'x') > 0 else pi
-            node.vertices.append((pi - angle, angle))
             x = size(surface, x, 'x')
+            new_point = old_x + x, old_y
+            marker_builder.line_to(current_point, new_point)
             surface.context.rel_line_to(x, 0)
-            current_point = current_point[0] + x, current_point[1]
+            current_point = new_point
 
         elif letter == 'H':
             # Horizontal line
             x, string = (string + ' ').split(' ', 1)
-            old_x, old_y = current_point
-            angle = 0 if size(surface, x, 'x') > old_x else pi
-            node.vertices.append((pi - angle, angle))
+            old_y = current_point[1]
             x = size(surface, x, 'x')
+            new_point = x, old_y
+            marker_builder.line_to(current_point, new_point)
             surface.context.line_to(x, old_y)
-            current_point = x, current_point[1]
+            current_point = new_point
 
         elif letter == 'l':
             # Relative straight line
             x, y, string = point(surface, string)
-            angle = point_angle(0, 0, x, y)
-            node.vertices.append((pi - angle, angle))
+            new_point = current_point[0] + x, current_point[1] + y
+            marker_builder.line_to(current_point, new_point)
             surface.context.rel_line_to(x, y)
-            current_point = current_point[0] + x, current_point[1] + y
+            current_point = new_point
 
         elif letter == 'L':
             # Straight line
             x, y, string = point(surface, string)
-            old_x, old_y = current_point
-            angle = point_angle(old_x, old_y, x, y)
-            node.vertices.append((pi - angle, angle))
+            new_point = x, y
+            marker_builder.line_to(current_point, new_point)
             surface.context.line_to(x, y)
-            current_point = x, y
+            current_point = new_point
 
         elif letter == 'm':
             # Current point relative move
             x, y, string = point(surface, string)
-            if last_letter and last_letter not in 'zZ':
-                node.vertices.append(None)
             surface.context.rel_move_to(x, y)
             current_point = current_point[0] + x, current_point[1] + y
+            marker_builder.move_to(current_point)
 
         elif letter == 'M':
             # Current point move
             x, y, string = point(surface, string)
-            if last_letter and last_letter not in 'zZ':
-                node.vertices.append(None)
             surface.context.move_to(x, y)
             current_point = x, y
+            marker_builder.move_to(current_point)
 
         elif letter == 'q':
             # Relative quadratic curve
             x1, y1 = 0, 0
             x2, y2, string = point(surface, string)
             x3, y3, string = point(surface, string)
+            control = current_point[0] + x2, current_point[1] + y2
+            new_point = current_point[0] + x3, current_point[1] + y3
             xq1, yq1, xq2, yq2, xq3, yq3 = quadratic_points(
                 x1, y1, x2, y2, x3, y3)
             surface.context.rel_curve_to(xq1, yq1, xq2, yq2, xq3, yq3)
-            node.vertices.append((0, 0))
-            current_point = current_point[0] + x3, current_point[1] + y3
+            marker_builder.quadratic_to(current_point, control, new_point)
+            quadratic_control = control
+            current_point = new_point
 
         elif letter == 'Q':
             # Quadratic curve
             x1, y1 = current_point
             x2, y2, string = point(surface, string)
             x3, y3, string = point(surface, string)
+            control = x2, y2
+            new_point = x3, y3
             xq1, yq1, xq2, yq2, xq3, yq3 = quadratic_points(
                 x1, y1, x2, y2, x3, y3)
             surface.context.curve_to(xq1, yq1, xq2, yq2, xq3, yq3)
-            node.vertices.append((0, 0))
-            current_point = x3, y3
+            marker_builder.quadratic_to(current_point, control, new_point)
+            quadratic_control = control
+            current_point = new_point
 
         elif letter == 's':
             # Relative smooth curve
@@ -353,10 +366,17 @@ def path(surface, node):
             y1 = y3 - y2 if last_letter in 'csCS' else 0
             x2, y2, string = point(surface, string)
             x3, y3, string = point(surface, string)
-            node.vertices.append((
-                point_angle(x2, y2, x1, y1), point_angle(x2, y2, x3, y3)))
+            control1 = (
+                2 * x - cubic_control[0], 2 * y - cubic_control[1]
+            ) if cubic_control is not None and last_letter in 'csCS' else (
+                x, y)
+            control2 = x + x2, y + y2
+            new_point = x + x3, y + y3
+            marker_builder.cubic_to(
+                current_point, control1, control2, new_point)
+            cubic_control = control2
             surface.context.rel_curve_to(x1, y1, x2, y2, x3, y3)
-            current_point = current_point[0] + x3, current_point[1] + y3
+            current_point = new_point
 
             # Save absolute values for x and y, useful if next letter is s or S
             x1 += x
@@ -373,10 +393,17 @@ def path(surface, node):
             y1 = y3 + (y3 - y2) if last_letter in 'csCS' else y
             x2, y2, string = point(surface, string)
             x3, y3, string = point(surface, string)
-            node.vertices.append((
-                point_angle(x2, y2, x1, y1), point_angle(x2, y2, x3, y3)))
+            control1 = (
+                2 * x - cubic_control[0], 2 * y - cubic_control[1]
+            ) if cubic_control is not None and last_letter in 'csCS' else (
+                x, y)
+            control2 = x2, y2
+            new_point = x3, y3
+            marker_builder.cubic_to(
+                current_point, control1, control2, new_point)
+            cubic_control = control2
             surface.context.curve_to(x1, y1, x2, y2, x3, y3)
-            current_point = x3, y3
+            current_point = new_point
 
         elif letter == 't':
             # Relative quadratic curve end
@@ -391,11 +418,18 @@ def path(surface, node):
             y2 = y3 - y2
             x1, y1 = 0, 0
             x3, y3, string = point(surface, string)
+            control = (
+                2 * current_point[0] - quadratic_control[0],
+                2 * current_point[1] - quadratic_control[1]
+            ) if quadratic_control is not None and last_letter in 'QqTt' else (
+                current_point)
+            new_point = current_point[0] + x3, current_point[1] + y3
             xq1, yq1, xq2, yq2, xq3, yq3 = quadratic_points(
                 x1, y1, x2, y2, x3, y3)
-            node.vertices.append((0, 0))
+            marker_builder.quadratic_to(current_point, control, new_point)
+            quadratic_control = control
             surface.context.rel_curve_to(xq1, yq1, xq2, yq2, xq3, yq3)
-            current_point = current_point[0] + x3, current_point[1] + y3
+            current_point = new_point
 
         elif letter == 'T':
             # Quadratic curve end
@@ -411,42 +445,49 @@ def path(surface, node):
             y2 = abs_y + (y3 - y2)
             x1, y1 = abs_x, abs_y
             x3, y3, string = point(surface, string)
+            control = (
+                2 * abs_x - quadratic_control[0],
+                2 * abs_y - quadratic_control[1]
+            ) if quadratic_control is not None and last_letter in 'QqTt' else (
+                current_point)
+            new_point = x3, y3
             xq1, yq1, xq2, yq2, xq3, yq3 = quadratic_points(
                 x1, y1, x2, y2, x3, y3)
-            node.vertices.append((0, 0))
+            marker_builder.quadratic_to(current_point, control, new_point)
+            quadratic_control = control
             surface.context.curve_to(xq1, yq1, xq2, yq2, xq3, yq3)
-            current_point = x3, y3
+            current_point = new_point
 
         elif letter == 'v':
             # Relative vertical line
             y, string = (string + ' ').split(' ', 1)
             old_x, old_y = current_point
-            angle = copysign(pi / 2, size(surface, y, 'y'))
-            node.vertices.append((-angle, angle))
             y = size(surface, y, 'y')
+            new_point = old_x, old_y + y
+            marker_builder.line_to(current_point, new_point)
             surface.context.rel_line_to(0, y)
-            current_point = current_point[0], current_point[1] + y
+            current_point = new_point
 
         elif letter == 'V':
             # Vertical line
             y, string = (string + ' ').split(' ', 1)
             old_x, old_y = current_point
-            angle = copysign(pi / 2, size(surface, y, 'y') - old_y)
-            node.vertices.append((-angle, angle))
             y = size(surface, y, 'y')
+            new_point = old_x, y
+            marker_builder.line_to(current_point, new_point)
             surface.context.line_to(old_x, y)
-            current_point = current_point[0], y
+            current_point = new_point
 
-        elif letter in 'zZ' and first_path_point:
+        elif letter in 'zZ':
             # End of path
-            node.vertices.append(None)
-            surface.context.close_path()
-            current_point = first_path_point
-
-        if letter not in 'zZ':
-            node.vertices.append(current_point)
+            marker_builder.close(current_point)
+            if first_path_point is not None:
+                surface.context.close_path()
+                current_point = first_path_point
 
         if string := string.strip():
             next_letter = {'m': 'l', 'M': 'L'}.get(letter, letter)
             matches.appendleft((next_letter, string))
         last_letter = letter
+
+    node.vertices = marker_builder.vertices()
