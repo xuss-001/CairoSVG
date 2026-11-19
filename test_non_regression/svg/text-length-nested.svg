@@ -1,0 +1,31 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="14cm" height="7cm" viewBox="0 0 520 260"
+     xmlns="http://www.w3.org/2000/svg" version="1.1">
+  <desc>textLength combined with text-anchor and nested tspans. A tspan
+        with its own textLength keeps that target while the parent text
+        element reaches its own target through the remaining characters.</desc>
+
+  <!-- Anchor markers -->
+  <g stroke="#7f8c8d" stroke-width="1" stroke-dasharray="4 4">
+    <line x1="260" y1="20" x2="260" y2="240"/>
+  </g>
+
+  <g font-family="sans-serif" font-size="18" fill="purple">
+    <text x="260" y="50" text-anchor="start" textLength="180">
+      start anchored
+    </text>
+    <text x="260" y="100" text-anchor="middle" textLength="180">
+      middle anchored
+    </text>
+    <text x="260" y="150" text-anchor="end" textLength="180">
+      end anchored
+    </text>
+
+    <!-- Nested constraints: the BC tspan keeps its 60-unit target -->
+    <text x="20" y="210" textLength="420">
+      A<tspan textLength="60" font-weight="bold">BC</tspan>DE follows
+    </text>
+  </g>
+</svg>

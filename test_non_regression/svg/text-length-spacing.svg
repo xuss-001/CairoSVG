@@ -1,0 +1,32 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="12cm" height="6cm" viewBox="0 0 450 220"
+     xmlns="http://www.w3.org/2000/svg" version="1.1">
+  <desc>textLength with the default spacing adjustment stretches and
+        compresses the inter-character advances without scaling glyphs.
+        The ruler marks the requested typographic length.</desc>
+
+  <g font-family="sans-serif" font-size="20" fill="navy">
+    <!-- Natural length, no textLength -->
+    <text x="20" y="40">natural: Hello</text>
+
+    <!-- Stretched spacing -->
+    <text x="20" y="90" textLength="300">stretched: Hello</text>
+
+    <!-- Compressed spacing -->
+    <text x="20" y="140" textLength="60">compressed: Hello</text>
+
+    <!-- Explicit pixel and em units, combined with letter-spacing -->
+    <text x="20" y="190" letter-spacing="4" textLength="12em">
+      units and spacing
+    </text>
+  </g>
+
+  <!-- Ruler showing the 300 user-unit target of the stretched line -->
+  <g stroke="#c0392b" stroke-width="1">
+    <line x1="20" y1="100" x2="320" y2="100"/>
+    <line x1="20" y1="96" x2="20" y2="104"/>
+    <line x1="320" y1="96" x2="320" y2="104"/>
+  </g>
+</svg>

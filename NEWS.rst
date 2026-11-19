@@ -3,6 +3,16 @@
 ======
 
 
+Version 2.9.2
+============
+
+* Support the ``textLength`` attribute on ``text`` and ``tspan`` elements
+* Support the ``lengthAdjust`` attribute, including horizontal glyph scaling
+  with ``spacingAndGlyphs``
+* Position ``text-anchor`` (``start``, ``middle`` and ``end``) from the
+  adjusted typographic length and keep nested constrained tspans consistent
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

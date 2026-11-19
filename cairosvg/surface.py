@@ -162,6 +162,7 @@ class Surface(object):
         self.cursor_position = [0, 0]
         self.cursor_d_position = [0, 0]
         self.text_path_width = 0
+        self.text_layout = None
         self.tree_cache = {(tree.url, tree.get('id')): tree}
         self.reference_count = 0
         if parent_surface:
@@ -493,6 +494,7 @@ class Surface(object):
             self.cursor_position = [0, 0]
             self.cursor_d_position = [0, 0]
             self.text_path_width = 0
+            self.text_layout = None
 
         self.context.restore()
         self.parent_node = old_parent_node

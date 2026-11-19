@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="12cm" height="5cm" viewBox="0 0 450 180"
+     xmlns="http://www.w3.org/2000/svg" version="1.1">
+  <desc>lengthAdjust="spacingAndGlyphs" scales the glyphs horizontally in
+        addition to adjusting the inter-character advances.</desc>
+
+  <g font-family="sans-serif" font-size="20" fill="darkgreen">
+    <text x="20" y="50">natural: Cairo</text>
+    <text x="20" y="100" textLength="320"
+          lengthAdjust="spacingAndGlyphs">stretched glyphs: Cairo</text>
+    <text x="20" y="150" textLength="50"
+          lengthAdjust="spacingAndGlyphs">compressed glyphs</text>
+  </g>
+
+  <g stroke="#c0392b" stroke-width="1">
+    <line x1="20" y1="110" x2="340" y2="110"/>
+    <line x1="20" y1="106" x2="20" y2="114"/>
+    <line x1="340" y1="106" x2="340" y2="114"/>
+  </g>
+</svg>
