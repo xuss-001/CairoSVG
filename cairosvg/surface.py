@@ -8,11 +8,13 @@ import io
 
 import cairocffi as cairo
 
+from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .colors import color, negate_color
 from .defs import (
     apply_filter_after_painting, apply_filter_before_painting, clip_path,
     filter_, gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
     parse_all_defs, pattern, prepare_filter, radial_gradient, use)
+from .features import match_features
 from .helpers import (
     UNITS, PointError, clip_rect, node_format, normalize, paint,
     preserve_ratio, size, transform)
@@ -376,28 +378,11 @@ class Surface(object):
             self.context.restore()
             self.context.clip()
         clip_path = parse_url(node.get('clip-path')).fragment
+        clip_pattern = None
         if clip_path:
-            path = self.paths.get(clip_path)
-            if path:
-                self.context.save()
-                if path.get('clipPathUnits') == 'objectBoundingBox':
-                    x = size(self, node.get('x'), 'x')
-                    y = size(self, node.get('y'), 'y')
-                    width = size(self, node.get('width'), 'x')
-                    height = size(self, node.get('height'), 'y')
-                    self.context.translate(x, y)
-                    self.context.scale(width, height)
-                path.tag = 'g'
-                self.stroke_and_fill = False
-                self.draw(path)
-                self.stroke_and_fill = True
-                path.tag = 'clipPath'
-                self.context.restore()
-                # TODO: fill rules are not handled by cairo for clips
-                # if node.get('clip-rule') == 'evenodd':
-                #     self.context.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
-                self.context.clip()
-                self.context.set_fill_rule(cairo.FILL_RULE_WINDING)
+            clip_pattern = self._clip_pattern_for(clip_path, node, frozenset())
+        if clip_pattern is not None:
+            self.context.push_group()
 
         save_cursor = copy.deepcopy(
             (self.cursor_position, self.cursor_d_position,
@@ -477,6 +462,10 @@ class Surface(object):
                 self.draw(child)
 
         # Apply filter, mask and opacity
+        if clip_pattern is not None:
+            self.context.pop_group_to_source()
+            self.context.mask(clip_pattern)
+
         if filter_ or mask or (opacity < 1 and node.children):
             self.context.pop_group_to_source()
             if filter_:
@@ -498,6 +487,120 @@ class Surface(object):
         self.parent_node = old_parent_node
         self.font_size = old_font_size
         self.context_width, self.context_height = old_context_size
+
+    def _clip_pattern_for(self, clip_id, target_node, visited):
+        """Return a cairo pattern of the clipPath ``clip_id`` alpha mask.
+
+        The pattern is anchored to the user space in effect for
+        ``target_node``. ``visited`` is the set of already expanded clip ids
+        and referenced elements, used to stop circular references.
+
+        """
+        clip_node = self.paths.get(clip_id)
+        if clip_node is None or clip_id in visited:
+            return None
+        visited = visited | {clip_id}
+        self.context.push_group()
+        self.context.save()
+        paint_content = True
+        if clip_node.get('clipPathUnits') == 'objectBoundingBox':
+            bounding_box = calculate_bounding_box(self, target_node)
+            if is_non_empty_bounding_box(bounding_box):
+                x, y, width, height = bounding_box
+                self.context.translate(x, y)
+                self.context.scale(width, height)
+            else:
+                # An empty bounding box clips everything out
+                paint_content = False
+        if paint_content:
+            transform(
+                self, clip_node.get('transform'),
+                transform_origin=clip_node.get('transform-origin'))
+            self._paint_clip_content(clip_node, target_node, visited)
+        self.context.restore()
+        return self.context.pop_group()
+
+    def _paint_clip_content(self, clip_node, target_node, visited):
+        """Paint the clipped silhouette of ``clip_node``'s children."""
+        own_clip = parse_url(clip_node.get('clip-path')).fragment
+        if own_clip and own_clip not in visited:
+            # The clipPath's own clip-path intersects its children geometry
+            pattern = self._clip_pattern_for(own_clip, target_node, visited)
+            if pattern is not None:
+                self.context.push_group()
+                self._paint_clip_children(clip_node, target_node, visited)
+                self.context.pop_group_to_source()
+                self.context.mask(pattern)
+                return
+        self._paint_clip_children(clip_node, target_node, visited)
+
+    def _paint_clip_children(self, clip_node, target_node, visited):
+        """Paint the union of ``clip_node``'s children silhouettes."""
+        for child in clip_node.children:
+            if child.get('display', 'inline') == 'none':
+                continue
+            child_clip = parse_url(child.get('clip-path')).fragment
+            if child_clip and child_clip not in visited:
+                # The child's own clip-path intersects its geometry before
+                # the child takes part in the union
+                pattern = self._clip_pattern_for(child_clip, child, visited)
+                if pattern is not None:
+                    self.context.push_group()
+                    self._paint_clip_geometry(child, target_node, visited)
+                    self.context.pop_group_to_source()
+                    self.context.mask(pattern)
+                    continue
+            self._paint_clip_geometry(child, target_node, visited)
+
+    def _paint_clip_geometry(self, node, target_node, visited):
+        """Paint the silhouette of a single clipPath child."""
+        self.context.save()
+        transform(
+            self, node.get('transform'),
+            transform_origin=node.get('transform-origin'))
+        if node.tag == 'use':
+            self._paint_clip_use(node, target_node, visited)
+        elif node.tag in ('a', 'g', 'svg', 'switch', 'symbol'):
+            self._paint_clip_children(node, target_node, visited)
+        elif node.tag in PATH_TAGS or TAGS.get(node.tag) == text:
+            self.context.new_path()
+            try:
+                TAGS[node.tag](self, node)
+            except PointError:
+                pass
+            # Each child uses its own (possibly inherited) clip-rule
+            if node.get('clip-rule') == 'evenodd':
+                self.context.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+            else:
+                self.context.set_fill_rule(cairo.FILL_RULE_WINDING)
+            # Fill, stroke and opacity of the child only define the
+            # silhouette, they must not leak into the painted result
+            self.context.set_source_rgba(0, 0, 0, 1)
+            self.context.fill()
+        self.context.restore()
+
+    def _paint_clip_use(self, node, target_node, visited):
+        """Paint the silhouette of a ``use`` element in a clipPath."""
+        href = parse_url(node.get_href()).geturl()
+        try:
+            tree = Tree(
+                url=href, url_fetcher=node.url_fetcher, parent=node,
+                tree_cache=self.tree_cache, unsafe=node.unsafe)
+        except TypeError:
+            return
+        # Stop circular references: the same element must not be expanded
+        # twice along a reference chain
+        if id(tree.xml_tree) in visited:
+            return
+        if not match_features(tree.xml_tree):
+            return
+        visited = visited | {id(tree.xml_tree)}
+        self.context.translate(
+            size(self, node.get('x'), 'x'), size(self, node.get('y'), 'y'))
+        if tree.tag in ('a', 'g', 'svg', 'switch', 'symbol'):
+            self._paint_clip_children(tree, target_node, visited)
+        else:
+            self._paint_clip_geometry(tree, target_node, visited)
 
 
 class PDFSurface(Surface):

@@ -3,6 +3,27 @@
 ======
 
 
+Unreleased
+==========
+
+* Fix clipPath geometry combination: each child now uses its own (possibly
+  inherited) ``clip-rule``, children combine as a union, a child's own
+  ``clip-path`` intersects it before the union, and the clipPath's own
+  ``clip-path`` intersects the whole result, instead of relying on a single
+  global fill rule
+* Support ``userSpaceOnUse`` and ``objectBoundingBox`` clipPathUnits; the
+  latter now relies on the target's real geometric bounding box (including
+  non-zero origins, curved paths and groups) instead of its ``width`` and
+  ``height`` attributes, avoiding invalid matrices for zero-sized boxes
+* Handle transforms and local ``use`` references inside clipPath, and make
+  reusing the same clipPath on objects at different positions and sizes
+  give correct, order-independent results
+* Don't leak clip children fill, stroke or opacity into the painted output,
+  and don't pollute the drawing state (fill rule) of normal drawing
+* Safely handle empty clips, zero-area bounding boxes and circular
+  references
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 
