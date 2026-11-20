@@ -5,9 +5,11 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+import copy
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
-from .helpers import paint, size, transform
+from .helpers import paint, parse_transform, size, transform
 from .parser import Tree
 from .shapes import rect
 from .surface import cairo
@@ -27,6 +29,11 @@ EXTEND_OPERATORS = {
     'reflect': cairo.EXTEND_REFLECT,
     'repeat': cairo.EXTEND_REPEAT,
 }
+
+INVISIBLE_DRAW_TAGS = frozenset((
+    'clipPath', 'defs', 'filter', 'linearGradient', 'marker', 'mask',
+    'pattern', 'radialGradient', 'symbol', 'title', 'desc',
+    'metadata', 'style'))
 
 
 def update_def_href(surface, def_name, def_dict, chain=None):
@@ -78,6 +85,18 @@ def gradient_or_pattern(surface, node, name, opacity):
     elif name in surface.patterns:
         update_def_href(surface, name, surface.patterns)
         return draw_pattern(surface, node, name, opacity)
+
+
+def pattern_is_drawing(node):
+    """Recursively check that a pattern contains something to draw."""
+    for child in node.children:
+        if child.tag in INVISIBLE_DRAW_TAGS:
+            continue
+        if child.children and pattern_is_drawing(child):
+            return True
+        if not child.children:
+            return True
+    return False
 
 
 def marker(surface, node):
@@ -219,51 +238,129 @@ def draw_gradient(surface, node, name, opacity):
 def draw_pattern(surface, node, name, opacity):
     """Draw a pattern image."""
     pattern_node = surface.patterns[name]
-    pattern_node['opacity'] = float(pattern_node.get('opacity', 1)) * opacity
-    pattern_node.tag = 'g'
-    transform(surface, pattern_node.get('patternTransform'))
 
-    if pattern_node.get('viewBox'):
-        if not (size(surface, pattern_node.get('width', 1), 1) and
-                size(surface, pattern_node.get('height', 1), 1)):
-            return False
-    else:
-        if not (size(surface, pattern_node.get('width', 0), 1) and
-                size(surface, pattern_node.get('height', 0), 1)):
-            return False
-
-    if pattern_node.get('patternUnits') == 'userSpaceOnUse':
-        x = size(surface, pattern_node.get('x'), 'x')
-        y = size(surface, pattern_node.get('y'), 'y')
-        pattern_width = size(surface, pattern_node.get('width', 0), 1)
-        pattern_height = size(surface, pattern_node.get('height', 0), 1)
-    else:
-        _, _, width, height = calculate_bounding_box(surface, node)
-        x = size(surface, pattern_node.get('x'), 1) * width
-        y = size(surface, pattern_node.get('y'), 1) * height
-        pattern_width = (
-            size(surface, pattern_node.pop('width', '1'), 1) * width)
-        pattern_height = (
-            size(surface, pattern_node.pop('height', '1'), 1) * height)
-        if 'viewBox' not in pattern_node:
-            pattern_node['width'] = pattern_width
-            pattern_node['height'] = pattern_height
-            if pattern_node.get('patternContentUnits') == 'objectBoundingBox':
-                pattern_node['transform'] = f'scale({width}, {height})'
-
-    # Fail if pattern has an invalid size
-    if pattern_width == 0.0 or pattern_height == 0.0:
+    # Guard against cyclic references between patterns
+    active_patterns = surface.active_patterns
+    if name in active_patterns:
         return False
 
+    # An empty pattern paints nothing, the fallback color is used by the
+    # caller instead
+    if not pattern_is_drawing(pattern_node):
+        return False
+
+    bounding_box_units = False
+    if pattern_node.get('patternUnits') == 'userSpaceOnUse':
+        # Coordinates and lengths are expressed in the current user space;
+        # percentages are relative to the current viewport
+        x = size(surface, pattern_node.get('x', '0'), 'x')
+        y = size(surface, pattern_node.get('y', '0'), 'y')
+        pattern_width = size(surface, pattern_node.get('width', '0'), 'x')
+        pattern_height = size(surface, pattern_node.get('height', '0'), 'y')
+    else:
+        # Coordinates and lengths are fractions of the target bounding box
+        bounding_box = calculate_bounding_box(surface, node)
+        if not is_non_empty_bounding_box(bounding_box):
+            return False
+        box_x, box_y, box_width, box_height = bounding_box
+        x = box_x + size(
+            surface, pattern_node.get('x', '0'), 1) * box_width
+        y = box_y + size(
+            surface, pattern_node.get('y', '0'), 1) * box_height
+        pattern_width = size(
+            surface, pattern_node.get('width', '1'), 1) * box_width
+        pattern_height = size(
+            surface, pattern_node.get('height', '1'), 1) * box_height
+        bounding_box_units = (
+            pattern_node.get('patternContentUnits') == 'objectBoundingBox')
+
+    # Fail if pattern has an invalid (zero or negative-sized) tile
+    if pattern_width <= 0.0 or pattern_height <= 0.0:
+        return False
+
+    # Never mutate the shared definition: each reference gets a private copy,
+    # so opacity is not accumulated and the pattern size is not changed
+    # between references
+    pattern_node = copy_node(pattern_node)
+    pattern_opacity = (
+        float(pattern_node.get('opacity', 1)) * opacity)
+    pattern_node.tag = 'g'
+    # Opacity is applied once on the final cairo pattern, never on the
+    # group rendered in the tile surface, where it would be multiplied again
+    pattern_node.pop('opacity', None)
+
+    if pattern_node.get('viewBox'):
+        # With a viewBox, preserveAspectRatio handles the mapping between
+        # the viewBox and the tile: patternContentUnits must be ignored
+        pattern_node.pop('patternContentUnits', None)
+    else:
+        # The tile surface is sized with the resolved tile dimensions:
+        # fractions of the bounding box, or viewport-relative percentages,
+        # become concrete user-space lengths
+        pattern_node['width'] = pattern_width
+        pattern_node['height'] = pattern_height
+        if bounding_box_units:
+            # Pattern contents are expressed in fractions of the
+            # bounding box
+            old_transform = pattern_node.get('transform')
+            content_transform = f'scale({box_width}, {box_height})'
+            pattern_node['transform'] = (
+                f'{old_transform} {content_transform}'
+                if old_transform else content_transform)
+
     from .surface import SVGSurface  # circular import
-    pattern_surface = SVGSurface(pattern_node, None, surface.dpi, surface)
+    active_patterns.add(name)
+    try:
+        pattern_surface = SVGSurface(
+            pattern_node, None, surface.dpi, surface)
+    finally:
+        active_patterns.discard(name)
     pattern_pattern = cairo.SurfacePattern(pattern_surface.cairo)
     pattern_pattern.set_extend(cairo.EXTEND_REPEAT)
-    pattern_pattern.set_matrix(cairo.Matrix(
-        pattern_surface.width / pattern_width, 0, 0,
-        pattern_surface.height / pattern_height, -x, -y))
+
+    # The tile surface is already sized with the resolved tile dimensions,
+    # so its user space matches the pattern tile one-to-one: the matrix
+    # only shifts the tiling origin to (x, y). Cairo pattern matrices map
+    # user space back into tile space, hence the negated translation.
+    pattern_matrix = cairo.Matrix(1, 0, 0, 1, -x, -y)
+
+    # Apply patternTransform on top of the tile mapping, without altering
+    # the current drawing context. Cairo pattern matrices map user space
+    # back into tile space: the user-space patternTransform is therefore
+    # inverted before being post-multiplied.
+    transform_matrix = parse_transform(
+        surface, pattern_node.get('patternTransform'))
+    if transform_matrix is not None:
+        transform_matrix.invert()
+        pattern_matrix = pattern_matrix.multiply(transform_matrix)
+
+    pattern_pattern.set_matrix(pattern_matrix)
+    if pattern_opacity < 1:
+        # Bake the opacity once into an independent tile copy: painting a
+        # semi-transparent pattern references the shared tile surface,
+        # which would accumulate the alpha on every reference. An
+        # ImageSurface keeps the semantics identical for every output
+        # backend while vector backends fall back to an embedded image.
+        tile_surface = cairo.ImageSurface(
+            cairo.FORMAT_ARGB32,
+            max(1, int(round(pattern_surface.width))),
+            max(1, int(round(pattern_surface.height))))
+        tile_context = cairo.Context(tile_surface)
+        tile_context.set_source_surface(pattern_surface.cairo, 0, 0)
+        tile_context.paint_with_alpha(pattern_opacity)
+        pattern_pattern = cairo.SurfacePattern(tile_surface)
+        pattern_pattern.set_extend(cairo.EXTEND_REPEAT)
+        pattern_pattern.set_matrix(pattern_matrix)
     surface.context.set_source(pattern_pattern)
     return True
+
+
+def copy_node(node):
+    """Return a private, shallow copy of a shared definition node."""
+    node_copy = copy.copy(node)
+    # The dict of attributes is copied too: mutating opacity, tag,
+    # transform or patternContentUnits never changes the shared node
+    return node_copy
 
 
 def prepare_filter(surface, node, name):

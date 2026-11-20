@@ -3,6 +3,28 @@
 ======
 
 
+Version 2.9.2
+=============
+
+* Fix SVG patterns reused by several shapes: the shared definition is no
+  longer mutated while rendering, so later references keep the original tile
+  size and opacity instead of growing or fading
+* Apply ``patternUnits="objectBoundingBox"`` relative to the origin and size
+  of the target geometry bounding box, so shapes drawn away from the origin
+  get correctly anchored tiles
+* Resolve percentage lengths of ``patternUnits="userSpaceOnUse"`` patterns
+  against the current viewport
+* Honor ``patternContentUnits`` with its own coordinate system, and ignore
+  it when a ``viewBox`` is defined as required by the SVG specification
+* Combine ``patternTransform``, ``viewBox`` and ``preserveAspectRatio``
+  correctly, including transforms nested inside the pattern contents
+* Apply pattern opacity once per reference instead of accumulating it across
+  references; semi-transparent patterns used on fills and strokes stay
+  independent
+* Safely handle zero-sized tiles, empty patterns and cyclic pattern
+  references instead of crashing or looping forever
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

@@ -194,14 +194,14 @@ def rotate(x, y, angle):
     return x * cos(angle) - y * sin(angle), y * cos(angle) + x * sin(angle)
 
 
-def transform(surface, transform_string, gradient=None, transform_origin=None):
-    """Transform ``surface`` or ``gradient`` if supplied using ``string``.
+def parse_transform(surface, transform_string, transform_origin=None):
+    """Parse a transform ``string`` and return the corresponding matrix.
 
     See http://www.w3.org/TR/SVG/coords.html#TransformAttribute
 
     """
     if not transform_string:
-        return
+        return None
 
     transformations = re.findall(
         r'(\w+) ?\( ?(.*?) ?\)', normalize(transform_string))
@@ -223,7 +223,7 @@ def transform(surface, transform_string, gradient=None, transform_origin=None):
             else:
                 origin_y = origin[1]
         else:
-            return
+            return None
 
         if origin_x == 'center':
             origin_x = surface.width / 2
@@ -272,6 +272,20 @@ def transform(surface, transform_string, gradient=None, transform_origin=None):
 
     if transform_origin:
         matrix.translate(-float(origin_x), -float(origin_y))
+
+    return matrix
+
+
+def transform(surface, transform_string, gradient=None, transform_origin=None):
+    """Transform ``surface`` or ``gradient`` if supplied using ``string``.
+
+    See http://www.w3.org/TR/SVG/coords.html#TransformAttribute
+
+    """
+    matrix = parse_transform(
+        surface, transform_string, transform_origin)
+    if matrix is None:
+        return
 
     try:
         matrix.invert()

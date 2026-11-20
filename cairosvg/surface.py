@@ -164,6 +164,8 @@ class Surface(object):
         self.text_path_width = 0
         self.tree_cache = {(tree.url, tree.get('id')): tree}
         self.reference_count = 0
+        self.active_patterns = (
+            parent_surface.active_patterns if parent_surface else set())
         if parent_surface:
             self.markers = parent_surface.markers
             self.gradients = parent_surface.gradients
